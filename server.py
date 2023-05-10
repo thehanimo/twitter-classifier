@@ -83,12 +83,6 @@ def run_hadoop():
         line.replace('\n', " ")
         fo.write(line)
         fo.write('\n')
-    to_process = tweets.find({'label': "Pending"})
-    for x in to_process:
-        line = str(x['_id']) + '\t' + x['text']
-        line.replace('\n', " ")
-        fo.write(line)
-        fo.write('\n')
     fo.close()
     cmd_str = "hadoop fs -rm -r -f twitter-test.txt twitter-test"
     subprocess.run(cmd_str, shell=True)
