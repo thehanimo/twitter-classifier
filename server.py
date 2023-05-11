@@ -13,6 +13,7 @@ from threading import Thread
 import os
 import time
 from classify import classify
+import dask
 
 app = Flask(__name__)
 
@@ -94,7 +95,20 @@ def run_hadoop():
     subprocess.run(cmd_str, shell=True)
     cmd_str = 'hadoop fs -copyToLocal twitter-test'
     subprocess.run(cmd_str, shell=True)
+
+@dask.delayed
+def store_class(ids, tweet):
+    print("Classifying tweet")
+    tags = classify(tweet)
+    if len(tags) == 0:
+        tags = ["Uncategorized"]
+    for id in ids:
+        tweets.update_one({"_id": ObjectId(id)}, {"$set": {"tags":tags, "label": "Done"}})
+
+def test():
     arr = os.listdir('twitter-test')
+    print("ASDF")
+    results = []
     for filename in arr:
         with open('twitter-test/'+filename) as file:
             for line in file:
@@ -102,12 +116,11 @@ def run_hadoop():
                 num_users = int(line.split('\t')[0])
                 ids = line.split('\t')[1:num_users+1]
                 tweet = "\t".join(line.split('\t')[num_users + 1:])
-                tags = classify(tweet)
-                if len(tags) == 0:
-                    tags = ["Uncategorized"]
-                for id in ids:
-                    tweets.update_one({"_id": ObjectId(id)}, {"$set": {"tags":tags, "label": "Done"}})
+                results.append(store_class(ids, tweet))
+    dask.compute(results)
     print("Done classifying!")
+
+test()
                 
 
 
