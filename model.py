@@ -1,87 +1,145 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.naive_bayes import BernoulliNB
-from sklearn import metrics
-from sklearn.utils import shuffle
-from imblearn.over_sampling import SMOTE
 import pickle
-# from xgboost import XGBClassifier
-# from sklearn.preprocessing import LabelEncoder
-# from sklearn.metrics import ConfusionMatrixDisplay
-# from sklearn.model_selection import cross_val_score
 
-#Load datasets
-gossip_fn = pd.read_csv("/Users/seungpang/Fake News/flask-server/GC_fake.csv")
-gossip_tn = pd.read_csv("/Users/seungpang/Fake News/flask-server/GC_real.csv")
-politi_fn = pd.read_csv("/Users/seungpang/Fake News/flask-server/PF_fake.csv")
-politi_tn = pd.read_csv("/Users/seungpang/Fake News/flask-server/PF_real.csv")
+import pyspark
+import sparknlp
+from pyspark import SparkContext,SparkConf
+from pyspark.sql import SparkSession
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.feature import StringIndexer
+from pyspark.ml.feature import Tokenizer, StopWordsRemover, RegexTokenizer
+from pyspark.sql.functions import regexp_replace
+from nltk.corpus import stopwords
+from sparknlp.base import Finisher, DocumentAssembler
+from sparknlp.annotator import (Tokenizer, Normalizer,
+                                LemmatizerModel, StopWordsCleaner)
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import HashingTF, IDF
 
-#concatenate fakenews
-fakenews = np.concatenate((politi_fn, gossip_fn))
-columns = ['id','news_url','title', 'tweet_ids']
-fakenews = pd.DataFrame(fakenews, columns = columns)
-fakenews = fakenews[['id','title']]
-ones = np.ones(fakenews.shape[0])
-fakenews = np.column_stack((fakenews, ones))
-fakenews = pd.DataFrame(fakenews, columns = ['id','title','flag'])
 
-#concatenate realnews
-realnews = np.concatenate((politi_tn, gossip_tn))
-realnews = pd.DataFrame(realnews, columns = columns)
-realnews = realnews[['id','title']]
-zeros = np.zeros(realnews.shape[0])
-realnews = np.column_stack((realnews, zeros))
-realnews = pd.DataFrame(realnews, columns = ['id','title','flag'])
+# conf = pyspark.SparkConf().set("spark.jars.packages",
+# "org.mongodb.spark:mongo-spark-connector_2.11:2.2.0")\
+# .getOrCreate()
+# Connect MongoDB to Spark
+working_directory = 'jars/*'
 
-#combine fakenews and realnews
-allnews = np.concatenate((fakenews, realnews))
-allnews = pd.DataFrame(allnews, columns = ['id','title','flag'])
-a_list = list(range(0, 23196))
-allnews['ind'] = a_list
-allnews.set_index('ind', inplace=True)
-allnews = shuffle(allnews)
+
+conf = SparkConf().set("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.1.1")
+sc = SparkContext(conf=conf)
+
+my_spark = SparkSession(sc) \
+    .builder \
+    .appName("myApp").config("spark.mongodb.read.connection.uri", 
+    "mongodb://127.0.0.1/twitterdata.labeleddata").getOrCreate()
+
+data = my_spark.read.format("mongodb").option("uri", 
+"mongodb://127.0.0.1/twitterdata.labeleddata").option("database", 
+"twitterdata").option("collection", "labeleddata").load()
+
+# conf = pyspark.SparkConf().setMaster("local[*]").setAppName("SparkTFIDF")
+# sc = pyspark.SparkContext(conf=conf)
+# spark = pyspark.sql.SparkSession(sc)
+
+# data = spark.read.format("csv")\
+#         .option("inferSchema", "true")\
+#         .option("header", "true")\
+#         .load("/Users/seungpang/Twitter Categorizer/flask-server/tweets.csv") 
+
+# #Select necessary columns - Tweets, Label
+data = data.select("Tweets", "Label")
+
+# #Drop null values
+data = data.na.drop()
+
+# #from pyspark.sql.functions import countDistinct
+correct_label=["celebrity","crypto","stocks","sports","politics"]
+data=data.filter(data.Label.isin(correct_label))
+
+#Split into training and test
+(df_train, df_test) = data.randomSplit([0.8, 0.2])
+
+#Regex Tokenize
+regexTokenizer = RegexTokenizer(inputCol="Tweets", outputCol="regex", pattern="\\W")
+regexTokenized = regexTokenizer.transform(df_train)
+
+#Stop Words Remove
+remover = StopWordsRemover(inputCol="regex", outputCol="stop_words")
+clean_df = remover.transform(regexTokenized)
 
 #tf-idf vectorizer
-tf_idf = TfidfVectorizer(analyzer='word', stop_words='english', strip_accents = "ascii")
-X = tf_idf.fit_transform(allnews['title'])
-pickle.dump(tf_idf, open('tfidf.pkl','wb'))
-y = allnews['flag'].astype('int')
-np.asarray(X)
-np.asarray(y)
+hashingTF = HashingTF(inputCol="stop_words", outputCol="rawfeatures",numFeatures=50)
+featurizedData = hashingTF.transform(clean_df)
 
-#split train and test
-Xtr, Xts, ytr, yts = train_test_split(X, y, random_state = 0, test_size = 0.3, stratify=allnews.flag)
+idf = IDF(inputCol="rawfeatures", outputCol="features")
+idfModel = idf.fit(featurizedData)
+df_train_tfidf = idfModel.transform(featurizedData)
 
-#SMOTE
-X_res, y_res = SMOTE().fit_resample(Xtr, ytr)
-np.asarray(X_res)
-np.asarray(y_res)
+#Index Label
+string_indexer = StringIndexer(inputCol='Label', outputCol='Label_Indexed')
+string_indexer_model = string_indexer.fit(df_train_tfidf)
+df_train_final = string_indexer_model.transform(df_train_tfidf)
 
-#Logistic Regression - before SMOTE F1 0.55, after SMOTE 0.65
-LR_Model = LogisticRegression()
-LR_Model.fit(X_res, y_res)
-pickle.dump(LR_Model, open('model.pkl','wb'))
-yhat = LR_Model.predict(Xts)
-print("F1: ", metrics.f1_score(yts, yhat))
+#Logistic Regression Model
+LR_Model = LogisticRegression(featuresCol=idf.getOutputCol(), labelCol=string_indexer_model.getOutputCol())
+lr_model = LR_Model.fit(df_train_final)
 
-# # Prediction
-# text = ["Christmas festival likely to happen in Brooklyn"]
-# model = pickle.load(open('model.pkl','rb'))
-# vectorizer = pickle.load(open('tfidf.pkl','rb'))
+# Transform the test set 
+df_test_token = regexTokenizer.transform(df_test)
+df_test_stopwords = remover.transform(df_test_token)
+df_test_tf = hashingTF.transform(df_test_stopwords)
+df_test_tfidf = idfModel.transform(df_test_tf)
+df_test_final= string_indexer_model.transform(df_test_tfidf)
 
-# predictions = model.predict(vectorizer.transform(text))
-# print(text)
-# print("Predicted as: {}".format(predictions[0]))
+#Prediction
+prediction = lr_model.transform(df_test_final)
+prediction = prediction.na.drop()
+prediction.select("Tweets", "Label", "Label_Indexed", "probability", "prediction").show(10)
+
+#Accuracy
+accuracy = prediction.filter(prediction.Label_Indexed == prediction.prediction).count() / float(prediction.count())
+print("Accuracy : ",accuracy)
 
 
-# text = ["Christmas festival likely to happen in Brooklyn this year"]
-# text_features = tf_idf.transform(text)
-# predictions = LR_Model.predict(text_features)
-# print(text)
-# print("Predicted as: {}".format(predictions[0]))
+#Dump Pickle ML Model and TFIDF Vect - Need the right syntax for PySpark 
+# with open('model_pkl', 'wb') as files:
+#     pickle.dump(lr_model, files)
+
+
+
+#Load datasets
+#tweet_data = pd.read_csv("/Users/seungpang/Twitter Categorizer/flask-server/tweets.csv")
+# train_data = spark.read.format("json")\
+#         .option("inferSchema", "true")\
+#         .option("header", "true")\
+#         .load("/Users/seungpang/Twitter Categorizer/flask-server/train_tweet.json") 
+
+# test_data = spark.read.format("json")\
+#         .option("inferSchema", "true")\
+#         .option("header", "true")\
+#         .load("/Users/seungpang/Twitter Categorizer/flask-server/test_tweet.json") 
+
+#Remove bracket in label_name col
+# from pyspark.sql.functions import col, concat_ws
+# train_data = train_data.withColumn("label",
+#    concat_ws(",",col("label_name")))
+
+# test_data = test_data.withColumn("label",
+#    concat_ws(",",col("label_name")))
+
+# #Select necessary columns - label_name, text
+# train_data = train_data.select("text", "label")
+# test_data = test_data.select("text", "label")
+
+#Drop null values
+# train_data = train_data.na.drop()
+# test_data = test_data.na.drop()
+
+# # Unique Labels - Train - 470 Test - 442
+# # train_data.select(countDistinct("label")).show()
+# # test_data.select(countDistinct("label")).show()
+
+# data = spark.read.format("csv")\
+#         .option("inferSchema", "true")\
+#         .option("header", "true")\
+#         .load("/Users/seungpang/Twitter Categorizer/flask-server/tweets.csv") 
